@@ -271,7 +271,7 @@ impl GlmBackend {
             .enumerate()
             .filter(|(_, p)| p.pos <= lim && p.pos > held && keys[..p.pos] == p.keys[..])
             .max_by_key(|(_, p)| p.pos)
-            .map(|(i, _)| i);
+            .map(|(_, p)| (p.pos, p.hash));
         // the current conversation's newest snapshot, if this request would overwrite it
         let cur = self
             .snaps
@@ -281,15 +281,22 @@ impl GlmBackend {
             .max_by_key(|(_, s)| s.pos)
             .map(|(i, s)| (i, s.pos))
             .filter(|&(_, pos)| pos > held && pos >= store.min_tokens);
+        // the candidate is named by (pos, hash), not by index: parking the current conversation first adds,
+        // supersedes and evicts entries (and must not drop the candidate)
         if let Some((si, _)) = cur {
-            self.park_out(si);
+            self.park_out(si, cand);
         }
-        if let Some(pi) = cand {
-            self.park_in(pi);
+        if let Some((pos, hash)) = cand {
+            let found = self.park.as_ref().unwrap().entries.iter().position(|p| p.pos == pos && p.hash == hash);
+            if let Some(pi) = found {
+                self.park_in(pi);
+            }
         }
     }
 
-    fn park_out(&mut self, si: usize) {
+    /// Park the conversation of snapshot `si`; `keep` (pos, hash) is an entry about to be read back: never
+    /// superseded or evicted here.
+    fn park_out(&mut self, si: usize, keep: Option<(usize, u64)>) {
         let (pos, hash, h_prev, buf) = {
             let s = &self.snaps[si];
             (s.pos, s.hash, s.h_prev.clone(), s.buf)
@@ -314,7 +321,7 @@ impl GlmBackend {
                 let mut i = 0;
                 while i < store.entries.len() {
                     let p = &store.entries[i];
-                    if p.pos <= pos && keys[..p.pos] == p.keys[..] {
+                    if p.pos <= pos && keys[..p.pos] == p.keys[..] && keep != Some((p.pos, p.hash)) {
                         store.remove(i);
                     } else {
                         i += 1;
@@ -331,8 +338,13 @@ impl GlmBackend {
                     used: self.clock,
                 });
                 while store.entries.len() > store.max {
-                    let old = (0..store.entries.len()).min_by_key(|&i| store.entries[i].used).unwrap();
-                    store.remove(old);
+                    let old = (0..store.entries.len())
+                        .filter(|&i| keep != Some((store.entries[i].pos, store.entries[i].hash)))
+                        .min_by_key(|&i| store.entries[i].used);
+                    match old {
+                        Some(i) => store.remove(i),
+                        None => break,
+                    }
                 }
                 eprintln!(
                     "glm-serve: parked {pos} tokens ({:.0} MiB) in {:.2} s ({} parked, {:.0} MiB on disk)",
