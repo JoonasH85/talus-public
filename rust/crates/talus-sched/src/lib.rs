@@ -325,6 +325,14 @@ pub struct GenCommand {
     pub logprobs: Option<usize>,
     /// E6: compact JSON Schema to constrain the output to (GEN key `json_schema=`, %-encoded); `None` = off.
     pub json_schema: Option<String>,
+    /// glm-vision fork: image embeddings (GEN key `emb=`, %-encoded path of a file of SVE1 records, one per image in
+    /// prompt order); `None` = a text-only request.
+    pub emb: Option<String>,
+    /// glm-vision fork: the prompt position where each image's rows start (GEN key `img_pos=`, comma list).
+    pub img_pos: Vec<usize>,
+    /// glm-vision fork: a content hash per image (GEN key `img_keys=`, comma list of hex u64) so the prompt cache
+    /// tells pictures apart (their tokens are all the same image token id).
+    pub img_keys: Vec<u64>,
 }
 
 impl Default for GenCommand {
@@ -345,6 +353,9 @@ impl Default for GenCommand {
             prompt_ids: Vec::new(),
             logprobs: None,
             json_schema: None,
+            emb: None,
+            img_pos: Vec::new(),
+            img_keys: Vec::new(),
         }
     }
 }
@@ -541,6 +552,16 @@ pub fn parse_gen_line(line: &str) -> Result<GenCommand, String> {
                     Some(parse_c_i32(v).clamp(0, talus_spec::logprobs::MAX_TOP_K as i32) as usize)
             }
             "json_schema" => cmd.json_schema = Some(gen_value_decode(v)),
+            "emb" => cmd.emb = Some(gen_value_decode(v)),
+            "img_pos" => {
+                cmd.img_pos = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            }
+            "img_keys" => {
+                cmd.img_keys = v
+                    .split(',')
+                    .filter_map(|x| u64::from_str_radix(x.trim(), 16).ok())
+                    .collect();
+            }
             _ => {}
         }
     }
@@ -1181,6 +1202,17 @@ mod tests {
         assert!(cmd.use_cache);
         assert_eq!(parse_gen_line("GEN 8 1,2").unwrap().json_schema, None);
         assert_eq!(gen_value_decode("%zz%4"), "%zz%4");
+    }
+
+    #[test]
+    fn parse_gen_line_image_keys() {
+        let cmd = parse_gen_line("GEN 8 emb=/tmp/a%20b.sve img_pos=3,40 img_keys=ff,0a1b 1,2,3").unwrap();
+        assert_eq!(cmd.emb.as_deref(), Some("/tmp/a b.sve"));
+        assert_eq!(cmd.img_pos, vec![3, 40]);
+        assert_eq!(cmd.img_keys, vec![0xff, 0x0a1b]);
+        assert_eq!(cmd.prompt_ids, vec![1, 2, 3]);
+        let plain = parse_gen_line("GEN 8 1,2").unwrap();
+        assert!(plain.emb.is_none() && plain.img_pos.is_empty() && plain.img_keys.is_empty());
     }
 
     #[test]

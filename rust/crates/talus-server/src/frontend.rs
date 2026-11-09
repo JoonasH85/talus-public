@@ -124,6 +124,80 @@ pub fn content_err_code(msg: &str) -> Option<&'static str> {
 }
 
 /// Extract text from a content field (string, array of content parts, or null).
+// ---- glm-vision fork: image parts --------------------------------------------------------------------------
+// With a vision encoder configured, the handlers switch the collector on before converting a request: each image
+// part then becomes IMAGE_MARK in the message text (in prompt order) and its base64 payload is kept; the server
+// encodes the payloads and puts the image's tokens where the marks are, at token level (render_and_encode_chat).
+// Without it (or for other routes) image parts are refused with HTTP 400 unsupported_content, as before.
+
+/// The mark an image part leaves in the message text (supplementary private use plane B, away from the literal-tag
+/// marks U+F0E01.. and the control marks U+F0E10..).
+pub const IMAGE_MARK: char = '\u{10FE01}';
+
+thread_local! {
+    static IMAGES: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start collecting image parts for the request this thread converts next (`on` = the server has an encoder).
+pub fn begin_images(on: bool) {
+    IMAGES.with(|c| *c.borrow_mut() = if on { Some(Vec::new()) } else { None });
+}
+
+/// The base64 payloads of the image parts converted since `begin_images`, in prompt order (and stop collecting).
+pub fn take_images() -> Vec<String> {
+    IMAGES.with(|c| c.borrow_mut().take()).unwrap_or_default()
+}
+
+fn collecting_images() -> bool {
+    IMAGES.with(|c| c.borrow().is_some())
+}
+
+/// An image part's base64 payload: OpenAI `image_url` ({"url": data URL} or a bare string), Responses
+/// `input_image` (`image_url` string), Anthropic `image` ({"source": {"type": "base64", "data": ...}}).
+fn image_payload(p: &JsonValue) -> Result<String, String> {
+    let url = match p.get("image_url") {
+        Some(JsonValue::Str(s)) => Some(s.clone()),
+        Some(u) => u.get_str("url").map(|s| s.to_string()),
+        None => None,
+    };
+    if let Some(url) = url {
+        if let Some(rest) = url.strip_prefix("data:") {
+            if let Some((meta, data)) = rest.split_once(',') {
+                if meta.ends_with(";base64") {
+                    return Ok(data.to_string());
+                }
+            }
+            return Err("image data URLs must be base64 (data:image/...;base64,...)".into());
+        }
+        return Err("image URLs are not fetched: send the picture as a base64 data URL".into());
+    }
+    if let Some(src) = p.get("source") {
+        if src.get_str("type") == Some("base64") {
+            if let Some(d) = src.get_str("data") {
+                return Ok(d.to_string());
+            }
+        }
+        return Err("image source must be base64 (source.type \"base64\" with data)".into());
+    }
+    Err("image part has no image_url or source".into())
+}
+
+/// Collect an image part when collecting is on: Some(the text to put in its place), None when it is off.
+fn collect_image_part(t: &str, p: &JsonValue) -> Option<Result<String, String>> {
+    let is_image = t == "image_url" || t == "input_image" || t == "image" || p.contains_key("image_url");
+    if !is_image || !collecting_images() {
+        return None;
+    }
+    Some(image_payload(p).map(|b64| {
+        IMAGES.with(|c| {
+            if let Some(v) = c.borrow_mut().as_mut() {
+                v.push(b64);
+            }
+        });
+        IMAGE_MARK.to_string()
+    }))
+}
+
 pub fn text_of_content(content: Option<&JsonValue>) -> Result<String, String> {
     match content {
         None | Some(JsonValue::Null) => Ok(String::new()),
@@ -146,6 +220,8 @@ pub fn text_of_content(content: Option<&JsonValue>) -> Result<String, String> {
                             out.push(txt.to_string());
                         } else if t == "refusal" {
                             // an assistant refusal part replayed from history: text-only, nothing to render (as before)
+                        } else if let Some(mark) = collect_image_part(t, p) {
+                            out.push(mark?); // glm-vision fork
                         } else {
                             // image_url / input_image / input_audio / file / ...: no vision or audio encoder yet, so
                             // refuse (HTTP 400 unsupported_content) instead of answering without the input
@@ -619,6 +695,13 @@ pub fn anthropic_to_messages_with_effort(
                         Some(other) => other.to_json_string(),
                     };
                     tool_results.push(txt);
+                }
+                "image" if collecting_images() => {
+                    // glm-vision fork: the mark goes where the picture is among the message's text
+                    match collect_image_part(btype, b) {
+                        Some(r) => text_parts.push(r?),
+                        None => return Err(unsupported_content_msg(btype, b)),
+                    }
                 }
                 "image" | "document" | "audio" | "video" | "file" => {
                     return Err(unsupported_content_msg(btype, b));

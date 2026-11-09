@@ -65,6 +65,86 @@ fn hash_prefix(t: &[u32]) -> u64 {
     h
 }
 
+/// glm-vision fork: the image rows of a request, from the file named by GEN `emb=` (SVE1 records written by the
+/// vision encoder, one per image in prompt order: int32 {0x31455653, n_tokens, nx, ny, n_embd} then
+/// float32 [n_tokens][n_embd]) placed at the positions GEN `img_pos=` names. Returns the flat rows and the
+/// position -> row map.
+fn load_images(
+    path: &str,
+    starts: &[usize],
+    n_embd: usize,
+    prompt_len: usize,
+) -> Result<(Vec<f32>, std::collections::HashMap<usize, usize>, Vec<usize>), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("image rows {path}: {e}"))?;
+    let mut rows: Vec<f32> = Vec::new();
+    let mut map = std::collections::HashMap::new();
+    let mut counts = Vec::new();
+    let mut off = 0usize;
+    let i32_at = |o: usize| -> Result<i32, String> {
+        bytes
+            .get(o..o + 4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| "image rows: truncated header".to_string())
+    };
+    for (k, &p0) in starts.iter().enumerate() {
+        if i32_at(off)? as u32 != 0x3145_5653 {
+            return Err(format!("image rows: record {k} is not SVE1"));
+        }
+        let n = i32_at(off + 4)?.max(0) as usize;
+        let e = i32_at(off + 16)?.max(0) as usize;
+        if e != n_embd {
+            return Err(format!("image rows: n_embd {e}, the model has {n_embd}"));
+        }
+        let body = off + 20;
+        let end = body + n * e * 4;
+        if end > bytes.len() {
+            return Err(format!("image rows: record {k} truncated"));
+        }
+        if p0 + n > prompt_len {
+            return Err(format!("image {k}: rows {p0}..{} past the prompt ({prompt_len})", p0 + n));
+        }
+        for j in 0..n {
+            let r = rows.len() / e;
+            if map.insert(p0 + j, r).is_some() {
+                return Err(format!("image {k}: position {} used twice", p0 + j));
+            }
+            let src = &bytes[body + j * e * 4..body + (j + 1) * e * 4];
+            rows.extend(src.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+        }
+        counts.push(n);
+        off = end;
+    }
+    if off != bytes.len() {
+        return Err(format!(
+            "image rows: {} images named, the file holds more ({} of {} bytes read)",
+            starts.len(),
+            off,
+            bytes.len()
+        ));
+    }
+    Ok((rows, map, counts))
+}
+
+/// glm-vision fork: the ids the prompt cache compares - the prompt's, with every image position replaced by a key
+/// of its image (content hash) and row, outside the vocabulary (bit 31 set), so a cached prefix only matches the
+/// same pictures at the same places.
+fn cache_keys(prompt: &[u32], starts: &[usize], counts: &[usize], img_keys: &[u64]) -> Vec<u32> {
+    let mut keys = prompt.to_vec();
+    for (k, (&p0, &n)) in starts.iter().zip(counts).enumerate() {
+        let ik = img_keys.get(k).copied().unwrap_or(0x9e37_79b9_7f4a_7c15 ^ k as u64);
+        for j in 0..n {
+            let mut h = ik ^ (j as u64).wrapping_mul(0x0100_0000_01b3);
+            h ^= h >> 29;
+            h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            h ^= h >> 32;
+            if let Some(slot) = keys.get_mut(p0 + j) {
+                *slot = 0x8000_0000 | (h as u32 & 0x7fff_ffff);
+            }
+        }
+    }
+    keys
+}
+
 impl GlmBackend {
     pub fn new(eng: GlmEngine, cfg: GlmCli) -> Self {
         let max_snaps = std::env::var("GLM_PROMPT_SNAPS")
@@ -98,10 +178,39 @@ impl GlmBackend {
                 reason: "empty prompt".into(),
             });
         }
+        // glm-vision fork: image rows for this request (none: a text-only request, exactly as before)
+        let keys: Vec<u32> = match cmd.emb.as_deref() {
+            Some(path) => {
+                let (rows, map, counts) =
+                    load_images(path, &cmd.img_pos, self.eng.w.hp.n_embd, prompt.len()).map_err(|e| {
+                        talus_core_api::CoreError::InvalidArgument { reason: e }
+                    })?;
+                if self.log {
+                    eprintln!("glm-serve: {} image(s), {} rows {:?}", counts.len(), map.len(), counts);
+                }
+                self.eng.set_images(rows, map)?;
+                cache_keys(&prompt, &cmd.img_pos, &counts, &cmd.img_keys)
+            }
+            None => prompt.clone(),
+        };
+        let r = self.run_keyed(cmd, stop, out, t0, prompt, keys);
+        self.eng.clear_images();
+        r
+    }
+
+    fn run_keyed(
+        &mut self,
+        cmd: &GenCommand,
+        stop: &CancelToken,
+        out: &mut dyn Write,
+        t0: Instant,
+        prompt: Vec<u32>,
+        keys: Vec<u32>,
+    ) -> talus_core_api::Result<()> {
         // common prefix with the committed history (at least one prompt token is evaluated for its logits)
         let mut l = 0;
         if cmd.use_cache {
-            while l < prompt.len() && l < self.hist.len() && prompt[l] == self.hist[l] {
+            while l < keys.len() && l < self.hist.len() && keys[l] == self.hist[l] {
                 l += 1;
             }
         }
@@ -111,7 +220,7 @@ impl GlmBackend {
         for (i, s) in self.snaps.iter().enumerate() {
             if s.pos <= l
                 && s.pos > best.map(|b| self.snaps[b].pos).unwrap_or(0)
-                && s.hash == hash_prefix(&prompt[..s.pos])
+                && s.hash == hash_prefix(&keys[..s.pos])
             {
                 best = Some(i);
             }
@@ -147,7 +256,7 @@ impl GlmBackend {
             let snaps = &mut self.snaps;
             let max_snaps = self.max_snaps;
             let clock = &mut self.clock;
-            let prompt_ref = &prompt;
+            let prompt_ref = &keys; // glm-vision fork: snapshots are named by the cache keys
             let mut pending: Option<usize> = None; // slot being filled
             let mut cb2 = |eng: &mut GlmEngine,
                            ev: SnapEvent|
@@ -248,7 +357,7 @@ impl GlmBackend {
         })?;
         // committed history: the prompt + the generated tokens the trunk has processed
         let processed = seq.n_past - n0;
-        self.hist = prompt.clone();
+        self.hist = keys.clone();
         self.hist
             .extend_from_slice(&gen[..processed.min(gen.len())]);
         let finish: &'static str = if cancelled {

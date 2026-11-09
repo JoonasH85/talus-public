@@ -31,8 +31,25 @@ pub const DEFERRED_FEATURES: &[(&str, &str)] = &[
 /// buffers that waiting clients (agents with parallel tool calls, the TUI, health checks) can hold.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
+/// glm-vision fork: the config's optional "vision" block (Strata's / Maya's format):
+/// {"exe": maya-vision, "mmproj": the projector GGUF, "model": a GGUF with the model's vocabulary, "gpu": false,
+/// "threads": N}. The encoder runs on the CPU unless "gpu" is true.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisionBlock {
+    pub exe: String,
+    pub mmproj: String,
+    pub model: String,
+    pub gpu: bool,
+    pub threads: Option<u32>,
+    /// the most image tokens a picture becomes (the encoder's --max-tokens; larger pictures are scaled down). A
+    /// 3840x2160 picture is ~8K tokens uncapped: 137 s and 3.75 GB on the CPU, 1980 tokens / 12.8 s / 2.0 GB at 2048.
+    pub max_tokens: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    /// glm-vision fork: images on when set (see VisionBlock); None = text only, as without the fork
+    pub vision: Option<VisionBlock>,
     pub host: String,
     pub port: u16,
     pub model_name: String,
@@ -98,6 +115,7 @@ impl Default for ServerConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         Self {
+            vision: None,
             host: "127.0.0.1".to_string(),
             port: 8000,
             model_name: "qwen3.8-27b".to_string(),
@@ -187,6 +205,21 @@ impl ServerConfig {
             ..Self::default()
         };
 
+        if let Some(v) = val.get("vision") {
+            let f = |k: &str| v.get_str(k).unwrap_or("").trim().to_string();
+            let (exe, mmproj, model) = (f("exe"), f("mmproj"), f("model"));
+            if exe.is_empty() || mmproj.is_empty() || model.is_empty() {
+                return Err("config \"vision\" needs \"exe\", \"mmproj\" and \"model\"".into());
+            }
+            cfg.vision = Some(VisionBlock {
+                exe,
+                mmproj,
+                model,
+                gpu: matches!(v.get("gpu"), Some(JsonValue::Bool(true))),
+                threads: v.get_usize("threads").map(|t| t as u32),
+                max_tokens: v.get_usize("max_tokens").map(|t| t as u32),
+            });
+        }
         if let Some(h) = val.get_str("host").filter(|s| !s.trim().is_empty()) {
             cfg.host = h.trim().to_string();
         }

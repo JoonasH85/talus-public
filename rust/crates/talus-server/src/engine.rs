@@ -181,6 +181,8 @@ pub fn gen_value_encode(v: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerateRequest {
     pub prompt_ids: Vec<u32>,
+    /// glm-vision fork: the pictures' rows and places (GEN `emb=` `img_pos=` `img_keys=`); None = text only
+    pub images: Option<crate::vision::ImageRequest>,
     pub max_new_tokens: usize,
     pub sampling: SamplingParams,
     pub stop_tokens: Vec<u32>,
@@ -928,6 +930,7 @@ impl ScriptedMockEngine {
                     .collect();
                 let req = GenerateRequest {
                     prompt_ids: prompt_ids.clone(),
+                    images: None,
                     max_new_tokens,
                     sampling,
                     stop_tokens: self.tok.stop_tokens.clone(),
@@ -1913,7 +1916,17 @@ impl StdioSubprocessEngine {
         on_token: &mut dyn FnMut(u32, Option<TokenLogprob>) -> bool,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<EngineTimings, EngineError> {
-        let keys = req.sampling.to_gen_keys();
+        let mut keys = req.sampling.to_gen_keys();
+        if let Some(im) = &req.images {
+            // glm-vision fork: the image rows file and where each picture's rows start in the prompt
+            let join = |v: Vec<String>| v.join(",");
+            keys.push_str(&format!(
+                " emb={} img_pos={} img_keys={}",
+                gen_value_encode(&im.emb),
+                join(im.pos.iter().map(|p| p.to_string()).collect()),
+                join(im.keys.iter().map(|k| format!("{k:x}")).collect()),
+            ));
+        }
         let csv_ids: String = req
             .prompt_ids
             .iter()

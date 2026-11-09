@@ -362,6 +362,12 @@ pub struct GlmEngine {
     graph_used: HashMap<GKey, u64>,
     graph_clock: u64,
     seen: std::collections::HashSet<GKey>,
+    /// glm-vision fork: image rows (F32, n_embd each, flat) that replace the token embedding at their prompt
+    /// positions (absolute position -> row index), for the request being prefilled; empty = text only.
+    img_rows: Vec<f32>,
+    img_map: HashMap<usize, usize>,
+    /// [lo, hi) of the image positions (a quick test before the map)
+    img_span: (usize, usize),
 }
 
 unsafe impl Send for GlmEngine {}
@@ -976,7 +982,70 @@ impl GlmEngine {
                 .unwrap_or(true),
             graphs: HashMap::new(),
             seen: Default::default(),
+            img_rows: Vec::new(),
+            img_map: HashMap::new(),
+            img_span: (0, 0),
         })
+    }
+
+    /// glm-vision fork: the image rows of the next prefill. `rows` holds `map.len()` rows of n_embd F32 values;
+    /// `map` sends each absolute prompt position to its row. The trunk and the MTP block read these rows in place
+    /// of the token embedding (GLM-5.3-Flash places an image's rows at its <|image|> tokens, ordinary positions).
+    pub fn set_images(&mut self, rows: Vec<f32>, map: HashMap<usize, usize>) -> Result<()> {
+        let e = self.w.hp.n_embd;
+        if rows.len() != map.len() * e || map.values().any(|&r| r >= map.len()) {
+            return Err(CoreError::InvalidArgument {
+                reason: format!("image rows: {} floats for {} positions of {e}", rows.len(), map.len()),
+            });
+        }
+        let lo = map.keys().copied().min().unwrap_or(0);
+        let hi = map.keys().copied().max().map(|m| m + 1).unwrap_or(0);
+        self.img_rows = rows;
+        self.img_map = map;
+        self.img_span = (lo, hi);
+        Ok(())
+    }
+
+    /// glm-vision fork: forget the image rows (after the request, or on an error).
+    pub fn clear_images(&mut self) {
+        self.img_rows = Vec::new();
+        self.img_map = HashMap::new();
+        self.img_span = (0, 0);
+    }
+
+    /// glm-vision fork: whether the window at self.c.pos0 of t rows holds an image position.
+    fn window_has_images(&self, t: usize) -> bool {
+        let (lo, hi) = self.img_span;
+        hi > lo && self.c.pos0 < hi && self.c.pos0 + t > lo
+    }
+
+    /// glm-vision fork: overwrite the embedding rows of the image positions in this window (`dst` = the embed
+    /// kernel's output, t rows of n_embd F32) with the image rows. Stream-ordered after the embed kernel; the
+    /// window runs eagerly (see `run`), never inside a captured graph.
+    fn apply_images(&self, dst: *mut f32, t: usize) -> Result<()> {
+        if !self.window_has_images(t) {
+            return Ok(());
+        }
+        let e = self.w.hp.n_embd;
+        for r in 0..t {
+            if let Some(&ri) = self.img_map.get(&(self.c.pos0 + r)) {
+                // SAFETY: dst holds t rows of e floats; img_rows holds the row (checked in set_images) and lives
+                // until clear_images, after the request's last stream sync.
+                unsafe {
+                    ffi::ckh(
+                        hip_sys::hipMemcpyAsync(
+                            dst.add(r * e) as *mut c_void,
+                            self.img_rows.as_ptr().add(ri * e) as *const c_void,
+                            e * 4,
+                            hip_sys::hipMemcpyHostToDevice,
+                            self.stream,
+                        ),
+                        "image rows H2D",
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -2911,6 +2980,7 @@ impl GlmEngine {
                 "tkg_embed",
             )?;
         }
+        self.apply_images(self.a.y.f(), t)?;
         // rb-num GLM_HC_BF16: 16-bit streams for prompt windows only (the streams live inside one window: written by
         // the first post-mix, read last by the head); decode / verify windows and layer dumps keep fp32
         self.hc16_win = if t > TMAX && self.dump.is_none() {
@@ -3475,6 +3545,8 @@ impl GlmEngine {
                     ),
                     "tkg_embed",
                 )?;
+                // glm-vision fork: an image position's MTP input is the image row too (Maya: next_img)
+                self.apply_images(a.memb.f(), t)?;
                 // [enorm(e) | hnorm(h)] rows of 2*e
                 ck(
                     (self.lib.g.rms_norm)(
@@ -3566,6 +3638,10 @@ impl GlmEngine {
     fn run(&mut self, k: GKey) -> Result<()> {
         // prefill chunks run eagerly (MMQ grids sized from routing read back on the host)
         if self.dump.is_some() || !self.use_graphs || k.t as usize > TMAX {
+            return self.exec(k);
+        }
+        // glm-vision fork: a window with image rows copies them in by position, which a graph would bake in
+        if self.window_has_images(k.t as usize) {
             return self.exec(k);
         }
         self.graph_clock += 1;

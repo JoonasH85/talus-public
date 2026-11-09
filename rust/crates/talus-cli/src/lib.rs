@@ -1987,6 +1987,10 @@ impl talus_server::Engine for Q36HttpServerEngine {
             // the in-process adapter does not advertise E1 (talus-server answers 400)
             logprobs: None,
             json_schema: req.sampling.json_schema.clone(),
+            // glm-vision fork: images only go through the stdio engine protocol (GEN emb=...)
+            emb: None,
+            img_pos: Vec::new(),
+            img_keys: Vec::new(),
         };
 
         let cancel_tok = CancelToken::from_arc(Arc::clone(&cancel));

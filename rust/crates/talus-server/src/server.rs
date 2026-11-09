@@ -84,6 +84,8 @@ pub struct ServiceState {
     pub http_limits: HttpLimits,
     /// Connections being served now (capped at `http_limits.max_connections`).
     pub open_connections: AtomicUsize,
+    /// glm-vision fork: the image encoder (config "vision"); None = text only, as without the fork
+    pub vision: Option<Arc<crate::vision::VisionEncoder>>,
 }
 
 impl ServiceState {
@@ -116,7 +118,28 @@ impl ServiceState {
             energy: Arc::new(crate::energy::EnergyMeter::new()),
             http_limits,
             open_connections: AtomicUsize::new(0),
+            vision: None,
         }
+        .with_vision()
+    }
+
+    /// glm-vision fork: start the image encoder when the config has a "vision" block.
+    fn with_vision(mut self) -> Self {
+        self.vision = crate::vision::encoder_from_config(&self.config);
+        self
+    }
+
+    /// glm-vision fork: the ids of the image tokens (<|begin_of_image|>, <|image|>, <|end_of_image|>).
+    fn image_token_ids(&self) -> Result<(u32, u32, u32), String> {
+        let id = |name: &str| {
+            self.tokenizer
+                .specials()
+                .iter()
+                .find(|(s, _)| s == name)
+                .map(|(_, i)| *i)
+                .ok_or_else(|| format!("this model's tokenizer has no {name} token: it can't read images"))
+        };
+        Ok((id("<|begin_of_image|>")?, id("<|image|>")?, id("<|end_of_image|>")?))
     }
 
     pub fn from_config(config: ServerConfig) -> Result<Self, String> {
@@ -483,6 +506,7 @@ fn warm_up(config: &ServerConfig, engine: &dyn Engine, tokenizer: &ByteTokenizer
     ids.truncate(n);
     let req = GenerateRequest {
         prompt_ids: ids,
+        images: None,
         max_new_tokens: 16,
         sampling: SamplingParams {
             temperature: 0.0,
@@ -1683,7 +1707,12 @@ fn handle_get(
                     JsonValue::obj(vec![
                         (
                             "input_modalities",
-                            JsonValue::Array(vec![JsonValue::from("text")]),
+                            // glm-vision fork: pictures too when the encoder is configured
+                            JsonValue::Array(if state.vision.is_some() {
+                                vec![JsonValue::from("text"), JsonValue::from("image")]
+                            } else {
+                                vec![JsonValue::from("text")]
+                            }),
                         ),
                         (
                             "output_modalities",
@@ -2894,6 +2923,7 @@ fn handle_llama_completion(
 
     let gen_req = GenerateRequest {
         prompt_ids: ids.clone(),
+        images: None,
         max_new_tokens: max_new,
         sampling,
         stop_tokens: state.tokenizer.stop_tokens.clone(),
@@ -3146,6 +3176,7 @@ fn handle_openai_completions(
 
     let gen_req = GenerateRequest {
         prompt_ids: ids.clone(),
+        images: None,
         max_new_tokens: max_new,
         sampling,
         stop_tokens: state.tokenizer.stop_tokens.clone(),
@@ -3417,6 +3448,8 @@ struct PreparedChat {
     force: Option<String>,
     /// E1 (opt-in): entries of generated tokens not yet handed to the client (chat streams drain it per chunk).
     lp_entries: std::cell::RefCell<Vec<JsonValue>>,
+    /// glm-vision fork: the request's pictures (None = text only)
+    images: Option<crate::vision::ImageRequest>,
 }
 
 fn render_and_encode_chat(
@@ -3426,6 +3459,21 @@ fn render_and_encode_chat(
     state: &ServiceState,
     force: Option<&str>,
 ) -> Result<(Vec<u32>, bool), String> {
+    render_and_encode_chat_images(messages, tools, kw, state, force, &[]).map(|(ids, th, _)| (ids, th))
+}
+
+/// glm-vision fork: `render_and_encode_chat` with pictures. `img_counts[k]` = the rows of the k-th picture: each
+/// IMAGE_MARK the frontend left in the rendered prompt becomes <|begin_of_image|>, that many <|image|> ids and
+/// <|end_of_image|>, put in at token level (the text around a mark is encoded on its own, as before). Returns the
+/// ids, thinking, and the position of each picture's first row.
+fn render_and_encode_chat_images(
+    messages: &[JsonValue],
+    tools: Option<&[JsonValue]>,
+    kw: &crate::frontend::TemplateKwargs,
+    state: &ServiceState,
+    force: Option<&str>,
+    img_counts: &[usize],
+) -> Result<(Vec<u32>, bool, Vec<usize>), String> {
     if let Some(ref tpl) = state.chat_template {
         let s_msgs: Vec<serde_json::Value> = messages
             .iter()
@@ -3462,6 +3510,45 @@ fn render_and_encode_chat(
                 rendered.push_str(f);
             }
         }
+        if !img_counts.is_empty() {
+            let (clean, plain_spans) = if changed {
+                talus_text::unmark_think_literals(&rendered, Some(&state.literal_tags))
+            } else {
+                (rendered.clone(), Vec::new())
+            };
+            let (boi, img, eoi) = state.image_token_ids()?;
+            let marks: Vec<usize> = clean
+                .char_indices()
+                .filter(|&(_, c)| c == crate::frontend::IMAGE_MARK)
+                .map(|(i, _)| i)
+                .collect();
+            if marks.len() != img_counts.len() {
+                return Err(format!(
+                    "the prompt has {} picture places for {} pictures",
+                    marks.len(),
+                    img_counts.len()
+                ));
+            }
+            let mlen = crate::frontend::IMAGE_MARK.len_utf8();
+            let (mut ids, mut starts, mut seg0) = (Vec::new(), Vec::new(), 0usize);
+            for (k, &m) in marks.iter().chain(std::iter::once(&clean.len())).enumerate() {
+                // this segment's literal spans, shifted to it (a span never crosses a mark)
+                let spans: Vec<(usize, usize)> = plain_spans
+                    .iter()
+                    .filter(|&&(a, b)| a >= seg0 && b <= m)
+                    .map(|&(a, b)| (a - seg0, b - seg0))
+                    .collect();
+                ids.extend(state.tokenizer.encode_with_plain_spans(&clean[seg0..m], true, &spans));
+                if k < img_counts.len() {
+                    ids.push(boi);
+                    starts.push(ids.len());
+                    ids.extend(std::iter::repeat_n(img, img_counts[k]));
+                    ids.push(eoi);
+                    seg0 = m + mlen;
+                }
+            }
+            return Ok((ids, thinking, starts));
+        }
         let ids = if changed {
             let (clean, plain_spans) =
                 talus_text::unmark_think_literals(&rendered, Some(&state.literal_tags));
@@ -3471,7 +3558,7 @@ fn render_and_encode_chat(
         } else {
             state.tokenizer.encode(&rendered, true)
         };
-        Ok((ids, thinking))
+        Ok((ids, thinking, Vec::new()))
     } else {
         let mut rendered = render_chat_prompt(messages, tools, kw);
         let thinking = kw.thinking_enabled();
@@ -3480,9 +3567,12 @@ fn render_and_encode_chat(
                 rendered.push_str(f);
             }
         }
+        if !img_counts.is_empty() {
+            return Err("pictures need the model's chat template".into());
+        }
         let segments = unmark_think_literals(&rendered);
         let ids = state.tokenizer.encode_with_plain(&segments);
-        Ok((ids, thinking))
+        Ok((ids, thinking, Vec::new()))
     }
 }
 
@@ -3496,8 +3586,34 @@ fn prepare_chat(
     force: Option<String>,
 ) -> Result<PreparedChat, String> {
     let (sampling, stops) = parse_sampling_from_req(req, &state.config.sampling)?;
-    let (ids, thinking) =
-        render_and_encode_chat(messages, tools.as_deref(), kw, state, force.as_deref())?;
+    // glm-vision fork: the pictures the frontend collected while converting this request, encoded first so their
+    // tokens go in at their places in one pass; a picture that can't be read fails the request (400)
+    let pictures = crate::frontend::take_images();
+    let mut encoded = Vec::new();
+    if !pictures.is_empty() {
+        let enc = state
+            .vision
+            .as_ref()
+            .ok_or("this server reads text only (no \"vision\" in its config)")?;
+        for (k, b64) in pictures.iter().enumerate() {
+            let bytes = crate::vision::base64_decode(b64)
+                .ok_or_else(|| format!("image {}: not valid base64", k + 1))?;
+            encoded.push(enc.encode(&bytes).map_err(|e| format!("image {} could not be read: {e}", k + 1))?);
+        }
+    }
+    let counts: Vec<usize> = encoded.iter().map(|e| e.n_tokens).collect();
+    let (ids, thinking, starts) =
+        render_and_encode_chat_images(messages, tools.as_deref(), kw, state, force.as_deref(), &counts)?;
+    let images = if encoded.is_empty() {
+        None
+    } else {
+        let emb = state.vision.as_ref().unwrap().combine(&encoded)?;
+        Some(crate::vision::ImageRequest {
+            emb: emb.to_string_lossy().into_owned(),
+            pos: starts,
+            keys: encoded.iter().map(|e| e.key).collect(),
+        })
+    };
     let ctx = state.reported_ctx();
     if ids.len() >= ctx {
         return Err(format!(
@@ -3519,6 +3635,7 @@ fn prepare_chat(
         stops,
         force,
         lp_entries: std::cell::RefCell::new(Vec::new()),
+        images,
     })
 }
 
@@ -3609,6 +3726,7 @@ where
     let mut tracker = RequestTracker::begin(state, prep.ids.len());
     let gen_req = GenerateRequest {
         prompt_ids: prep.ids.clone(),
+        images: prep.images.clone(),
         max_new_tokens: prep.max_new,
         sampling: prep.sampling.clone(),
         stop_tokens: state.tokenizer.stop_tokens.clone(),
@@ -3843,6 +3961,7 @@ fn handle_openai_chat(
     req: &JsonValue,
     state: &Arc<ServiceState>,
 ) -> std::io::Result<()> {
+    crate::frontend::begin_images(state.vision.is_some()); // glm-vision fork
     let (messages, mut tools, mut kw) = match openai_to_messages(req) {
         Ok(v) => v,
         Err(e) => {
@@ -4296,6 +4415,7 @@ fn handle_responses(
     if let Err(e) = check_responses_request(req) {
         return write_json(stream, e.status, &e.to_body(), &[]);
     }
+    crate::frontend::begin_images(state.vision.is_some()); // glm-vision fork
     let messages = match responses_input_messages(req) {
         Ok(m) => m,
         Err(e) => return write_json(stream, e.status, &e.to_body(), &[]),
@@ -4425,6 +4545,7 @@ fn handle_anthropic_count_tokens(
     req: &JsonValue,
     state: &Arc<ServiceState>,
 ) -> std::io::Result<()> {
+    crate::frontend::begin_images(false); // glm-vision fork: never a leftover collector from an earlier request
     let (messages, tools, kw) =
         match anthropic_to_messages(req, state.config.anthropic_think_unasked) {
             Ok(v) => v,
@@ -4448,6 +4569,7 @@ fn handle_anthropic_messages(
     req: &JsonValue,
     state: &Arc<ServiceState>,
 ) -> std::io::Result<()> {
+    crate::frontend::begin_images(state.vision.is_some()); // glm-vision fork
     let (messages, mut tools, kw) =
         match anthropic_to_messages(req, state.config.anthropic_think_unasked) {
             Ok(v) => v,
