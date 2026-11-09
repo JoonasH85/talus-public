@@ -3782,7 +3782,81 @@ impl GlmEngine {
         self.st.cur_slot = 0;
         ffi::sync(self.stream)
     }
+
+    // ---- glm-vision fork: conversation parking ---------------------------------------------------------------------
+
+    /// The device ranges that hold a conversation's state up to `pos` (a prompt snapshot point, a multiple of kpool):
+    /// the MLA latent rows 0..pos (`k_mla_store`: row p at p * kv_lora) and the indexer pools 0..pos/kpool
+    /// (`k_idx_pool`: pool p/kpool) of every DSA layer (trunk + MTP), the whole key|gate rings (TKG_KG_RING rows,
+    /// small), and the recurrent-state snapshot `snap` (`snap_save` layout).
+    fn park_ranges(&self, pos: usize, snap: &Buf) -> Vec<(*mut c_void, usize)> {
+        let hp = &self.w.hp;
+        let mut v = Vec::new();
+        for b in &self.st.mla_kv {
+            v.push((b.p, (pos * hp.kv_lora * 2).min(b.bytes)));
+        }
+        for b in &self.st.pooled {
+            v.push((b.p, (pos.div_ceil(hp.kpool) * hp.idx_dim * 2).min(b.bytes)));
+        }
+        for b in &self.st.keygate {
+            v.push((b.p, b.bytes));
+        }
+        v.push((snap.p, snap.bytes));
+        v
+    }
+
+    /// Bytes of a parked conversation of `pos` tokens (see [`Self::park_ranges`]).
+    pub fn park_bytes(&self, pos: usize, snap: &Buf) -> usize {
+        self.park_ranges(pos, snap).iter().map(|r| r.1).sum()
+    }
+
+    /// Write a conversation's state up to `pos` (see [`Self::park_ranges`]) to `f` through a host bounce buffer.
+    pub fn park_write(&mut self, pos: usize, snap: &Buf, f: &mut dyn std::io::Write) -> Result<usize> {
+        ffi::sync(self.stream)?;
+        let mut tmp = vec![0u8; PARK_CHUNK];
+        let mut total = 0usize;
+        for (p, n) in self.park_ranges(pos, snap) {
+            let mut off = 0usize;
+            while off < n {
+                let k = (n - off).min(PARK_CHUNK);
+                // SAFETY: off + k <= n, inside the device buffer; tmp holds PARK_CHUNK >= k bytes.
+                let src = unsafe { (p as *const u8).add(off) } as *const c_void;
+                ffi::d2h(tmp.as_mut_ptr() as *mut c_void, src, k)?;
+                f.write_all(&tmp[..k]).map_err(|e| CoreError::InvalidArgument {
+                    reason: format!("park write: {e}"),
+                })?;
+                off += k;
+            }
+            total += n;
+        }
+        Ok(total)
+    }
+
+    /// Read a conversation's state written by [`Self::park_write`] back into the caches and `snap`.
+    pub fn park_read(&mut self, pos: usize, snap: &Buf, f: &mut dyn std::io::Read) -> Result<usize> {
+        ffi::sync(self.stream)?;
+        let mut tmp = vec![0u8; PARK_CHUNK];
+        let mut total = 0usize;
+        for (p, n) in self.park_ranges(pos, snap) {
+            let mut off = 0usize;
+            while off < n {
+                let k = (n - off).min(PARK_CHUNK);
+                f.read_exact(&mut tmp[..k]).map_err(|e| CoreError::InvalidArgument {
+                    reason: format!("park read: {e}"),
+                })?;
+                // SAFETY: off + k <= n, inside the device buffer.
+                let dst = unsafe { (p as *mut u8).add(off) } as *mut c_void;
+                ffi::h2d(dst, tmp.as_ptr() as *const c_void, k)?;
+                off += k;
+            }
+            total += n;
+        }
+        Ok(total)
+    }
 }
+
+/// glm-vision fork: host bounce buffer of conversation parking.
+const PARK_CHUNK: usize = 32 << 20;
 
 /// Raw `/proc/meminfo` MemAvailable delta around `f` (bytes released, 0 if none or unreadable).
 fn freed_by(f: impl FnOnce() -> bool) -> u64 {

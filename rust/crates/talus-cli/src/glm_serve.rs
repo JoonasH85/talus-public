@@ -51,6 +51,83 @@ pub struct GlmBackend {
     log: bool,
     /// TALUS_MEM_SHED_EVERY: 1 = every class, or a comma list of graphs,snapshots,pcache,arenas
     shed_every: Option<String>,
+    /// glm-vision fork: conversations parked on disk (GLM_PARK_DIR set), None = off
+    park: Option<ParkStore>,
+}
+
+/// glm-vision fork: one conversation's caches up to one of its prompt snapshots, parked in a file while other
+/// requests (an agent's side tasks: titles, summaries, picture calls) use the single set of caches.
+struct Parked {
+    /// the cache keys of positions 0..pos
+    keys: Vec<u32>,
+    pos: usize,
+    hash: u64,
+    h_prev: Vec<f32>,
+    file: std::path::PathBuf,
+    bytes: usize,
+    used: u64,
+}
+
+/// glm-vision fork: conversation parking. A request that would overwrite the current conversation's caches (it does
+/// not extend that conversation up to its snapshot) first writes them to a file (GLM_PARK_MIN tokens or more); a
+/// request that extends a parked conversation further than the caches it finds reads that one back. The state is
+/// the one the in-memory prompt cache would resume from (latent rows, indexer pools and key|gate rings up to the
+/// snapshot, the snapshot's recurrent state and h_prev), so the resumed turn is the turn that had no side request.
+struct ParkStore {
+    dir: std::path::PathBuf,
+    /// GLM_PARK_MAX parked conversations (default 2), least recently used out first
+    max: usize,
+    /// GLM_PARK_MIN: smaller conversations are cheaper to read again (default 4096 tokens)
+    min_tokens: usize,
+    entries: Vec<Parked>,
+    seq: u64,
+}
+
+impl ParkStore {
+    fn from_env() -> Option<Self> {
+        let dir = std::path::PathBuf::from(std::env::var("GLM_PARK_DIR").ok().filter(|d| !d.is_empty())?);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("glm-serve: parking off: {}: {e}", dir.display());
+            return None;
+        }
+        // files of an earlier engine process are useless (its caches are gone): only our own name pattern
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with("park-") && n.ends_with(".bin") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let num = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let s = Self {
+            dir,
+            max: num("GLM_PARK_MAX", 2).max(1),
+            min_tokens: num("GLM_PARK_MIN", 4096),
+            entries: vec![],
+            seq: 0,
+        };
+        eprintln!(
+            "glm-serve: parking on: {} (max {}, min {} tokens)",
+            s.dir.display(),
+            s.max,
+            s.min_tokens
+        );
+        Some(s)
+    }
+
+    fn remove(&mut self, i: usize) {
+        let p = self.entries.remove(i);
+        let _ = std::fs::remove_file(&p.file);
+    }
+}
+
+impl Drop for ParkStore {
+    fn drop(&mut self) {
+        for p in &self.entries {
+            let _ = std::fs::remove_file(&p.file);
+        }
+    }
 }
 
 fn hash_prefix(t: &[u32]) -> u64 {
@@ -162,6 +239,176 @@ impl GlmBackend {
             shed_every: std::env::var("TALUS_MEM_SHED_EVERY")
                 .ok()
                 .filter(|v| !v.is_empty() && v != "0"),
+            park: ParkStore::from_env(),
+        }
+    }
+
+    /// glm-vision fork: before a request, park the current conversation if this request would overwrite it, and
+    /// read back the parked conversation this request extends (if it gets further than the caches as they are).
+    /// Errors are logged, never fatal: the request then runs as without parking.
+    fn park_switch(&mut self, keys: &[u32], lim: usize) {
+        let Some(store) = self.park.as_ref() else {
+            return;
+        };
+        let valid = |s: &Snap, t: &[u32]| s.pos != usize::MAX && s.pos > 0 && s.pos <= t.len() && s.hash == hash_prefix(&t[..s.pos]);
+        // what this request resumes from without parking
+        let mut common = 0;
+        while common < keys.len() && common < self.hist.len() && keys[common] == self.hist[common] {
+            common += 1;
+        }
+        let common = common.min(lim);
+        let held = self
+            .snaps
+            .iter()
+            .filter(|s| s.pos <= common && valid(s, keys))
+            .map(|s| s.pos)
+            .max()
+            .unwrap_or(0);
+        // the parked conversation this request extends furthest
+        let cand = store
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.pos <= lim && p.pos > held && keys[..p.pos] == p.keys[..])
+            .max_by_key(|(_, p)| p.pos)
+            .map(|(i, _)| i);
+        // the current conversation's newest snapshot, if this request would overwrite it
+        let cur = self
+            .snaps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| valid(s, &self.hist))
+            .max_by_key(|(_, s)| s.pos)
+            .map(|(i, s)| (i, s.pos))
+            .filter(|&(_, pos)| pos > held && pos >= store.min_tokens);
+        if let Some((si, _)) = cur {
+            self.park_out(si);
+        }
+        if let Some(pi) = cand {
+            self.park_in(pi);
+        }
+    }
+
+    fn park_out(&mut self, si: usize) {
+        let (pos, hash, h_prev, buf) = {
+            let s = &self.snaps[si];
+            (s.pos, s.hash, s.h_prev.clone(), s.buf)
+        };
+        let store = self.park.as_mut().unwrap();
+        if store.entries.iter().any(|p| p.pos == pos && p.hash == hash) {
+            return; // parked already (and unchanged: the caches below a snapshot are never rewritten in place)
+        }
+        let t = Instant::now();
+        store.seq += 1;
+        let file = store.dir.join(format!("park-{}-{}.bin", std::process::id(), store.seq));
+        let r = std::fs::File::create(&file)
+            .map_err(|e| talus_core_api::CoreError::InvalidArgument {
+                reason: format!("park file: {e}"),
+            })
+            .and_then(|mut f| self.eng.park_write(pos, &buf, &mut f));
+        let store = self.park.as_mut().unwrap();
+        match r {
+            Ok(bytes) => {
+                // a parked prefix of this conversation is superseded
+                let keys = self.hist[..pos].to_vec();
+                let mut i = 0;
+                while i < store.entries.len() {
+                    let p = &store.entries[i];
+                    if p.pos <= pos && keys[..p.pos] == p.keys[..] {
+                        store.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                self.clock += 1;
+                store.entries.push(Parked {
+                    keys,
+                    pos,
+                    hash,
+                    h_prev,
+                    file,
+                    bytes,
+                    used: self.clock,
+                });
+                while store.entries.len() > store.max {
+                    let old = (0..store.entries.len()).min_by_key(|&i| store.entries[i].used).unwrap();
+                    store.remove(old);
+                }
+                eprintln!(
+                    "glm-serve: parked {pos} tokens ({:.0} MiB) in {:.2} s ({} parked, {:.0} MiB on disk)",
+                    bytes as f64 / (1u64 << 20) as f64,
+                    t.elapsed().as_secs_f64(),
+                    store.entries.len(),
+                    store.entries.iter().map(|p| p.bytes).sum::<usize>() as f64 / (1u64 << 20) as f64
+                );
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&file);
+                eprintln!("glm-serve: park of {pos} tokens failed: {e}");
+            }
+        }
+    }
+
+    fn park_in(&mut self, pi: usize) {
+        // the snapshot slot to fill: a free one, else the least recently used (the current conversation was parked)
+        let si = if self.snaps.len() < self.max_snaps.max(1) {
+            match self.eng.snap_alloc() {
+                Ok(buf) => {
+                    self.snaps.push(Snap {
+                        pos: usize::MAX,
+                        hash: 0,
+                        h_prev: vec![],
+                        buf,
+                        used: 0,
+                    });
+                    self.snaps.len() - 1
+                }
+                Err(e) => {
+                    eprintln!("glm-serve: restore skipped (no snapshot buffer: {e})");
+                    return;
+                }
+            }
+        } else {
+            (0..self.snaps.len()).min_by_key(|&i| self.snaps[i].used).unwrap()
+        };
+        let t = Instant::now();
+        let (pos, file) = {
+            let p = &self.park.as_ref().unwrap().entries[pi];
+            (p.pos, p.file.clone())
+        };
+        let buf = self.snaps[si].buf;
+        self.snaps[si].pos = usize::MAX; // invalid until read
+        let r = std::fs::File::open(&file)
+            .map_err(|e| talus_core_api::CoreError::InvalidArgument {
+                reason: format!("park file: {e}"),
+            })
+            .and_then(|mut f| self.eng.park_read(pos, &buf, &mut f));
+        let store = self.park.as_mut().unwrap();
+        match r {
+            Ok(bytes) => {
+                self.clock += 1;
+                let p = &mut store.entries[pi];
+                p.used = self.clock;
+                self.snaps[si] = Snap {
+                    pos,
+                    hash: p.hash,
+                    h_prev: p.h_prev.clone(),
+                    buf,
+                    used: self.clock,
+                };
+                self.hist = p.keys.clone();
+                eprintln!(
+                    "glm-serve: restored {pos} tokens ({:.0} MiB) in {:.2} s",
+                    bytes as f64 / (1u64 << 20) as f64,
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => {
+                // the caches may be half overwritten: nothing in them is reusable now
+                self.hist.clear();
+                store.remove(pi);
+                eprintln!("glm-serve: restore of {pos} tokens failed: {e}");
+            }
         }
     }
 
@@ -207,6 +454,10 @@ impl GlmBackend {
         prompt: Vec<u32>,
         keys: Vec<u32>,
     ) -> talus_core_api::Result<()> {
+        // glm-vision fork: conversation parking (GLM_PARK_DIR)
+        if cmd.use_cache {
+            self.park_switch(&keys, prompt.len() - 1);
+        }
         // common prefix with the committed history (at least one prompt token is evaluated for its logits)
         let mut l = 0;
         if cmd.use_cache {
