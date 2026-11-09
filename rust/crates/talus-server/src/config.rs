@@ -44,6 +44,10 @@ pub struct VisionBlock {
     /// the most image tokens a picture becomes (the encoder's --max-tokens; larger pictures are scaled down). A
     /// 3840x2160 picture is ~8K tokens uncapped: 137 s and 3.75 GB on the CPU, 1980 tokens / 12.8 s / 2.0 GB at 2048.
     pub max_tokens: Option<u32>,
+    /// the encoder process quits after this many seconds without a picture (its ~1.6-2 GB back for the engine; it
+    /// starts again in ~1 s with the next picture); config "idle_secs", default 60; 0 = quits as soon as a request's
+    /// pictures are encoded (before the engine reads the request)
+    pub idle_secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +222,7 @@ impl ServerConfig {
                 gpu: matches!(v.get("gpu"), Some(JsonValue::Bool(true))),
                 threads: v.get_usize("threads").map(|t| t as u32),
                 max_tokens: v.get_usize("max_tokens").map(|t| t as u32),
+                idle_secs: v.get_u64("idle_secs").unwrap_or(60),
             });
         }
         if let Some(h) = val.get_str("host").filter(|s| !s.trim().is_empty()) {

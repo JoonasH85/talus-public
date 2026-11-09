@@ -492,6 +492,7 @@ for line in sys.stdin:
         sampling: SamplingParams::default(),
         stop_tokens: vec![],
         stop_strings: vec![],
+        images: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let mut streamed = Vec::new();

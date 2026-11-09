@@ -3600,6 +3600,7 @@ fn prepare_chat(
                 .ok_or_else(|| format!("image {}: not valid base64", k + 1))?;
             encoded.push(enc.encode(&bytes).map_err(|e| format!("image {} could not be read: {e}", k + 1))?);
         }
+        enc.release_after_use();
     }
     let counts: Vec<usize> = encoded.iter().map(|e| e.n_tokens).collect();
     let (ids, thinking, starts) =

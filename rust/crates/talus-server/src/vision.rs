@@ -57,6 +57,8 @@ pub struct VisionEncoder {
     proc: Mutex<Option<Proc>>,
     /// picture key -> (rows file, rows); bounded, oldest out first
     cache: Mutex<(HashMap<u64, (PathBuf, usize)>, VecDeque<u64>)>,
+    /// the last picture the encoder process handled (idle shutdown, `idle_secs`)
+    last_use: Mutex<std::time::Instant>,
 }
 
 const CACHE_MAX: usize = 64;
@@ -108,7 +110,48 @@ impl VisionEncoder {
             dir,
             proc: Mutex::new(None),
             cache: Mutex::new((HashMap::new(), VecDeque::new())),
+            last_use: Mutex::new(std::time::Instant::now()),
         })
+    }
+
+    /// Quit the encoder process after `idle_secs` without a picture (`idle_secs` 0: a 5 s safety net behind
+    /// [`Self::release_after_use`]); never while it encodes: the process lock is only tried. The next picture starts
+    /// it again (~1 s).
+    fn reap_idle(&self) {
+        if self.last_use.lock().unwrap().elapsed().as_secs() < self.cfg.idle_secs.max(5) {
+            return;
+        }
+        self.stop_proc();
+    }
+
+    /// `idle_secs` 0: quit the encoder as soon as a request's pictures are encoded, so its memory is back before
+    /// the engine reads the request (at 128K context a resident encoder takes the engine below its shed line).
+    pub fn release_after_use(&self) {
+        if self.cfg.idle_secs == 0 {
+            self.stop_proc();
+        }
+    }
+
+    fn stop_proc(&self) {
+        let Ok(mut g) = self.proc.try_lock() else {
+            return;
+        };
+        if let Some(mut p) = g.take() {
+            if let Some(stdin) = p.child.stdin.as_mut() {
+                let _ = writeln!(stdin, "QUIT");
+                let _ = stdin.flush();
+            }
+            for _ in 0..30 {
+                if matches!(p.child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            drop(p); // kills it if QUIT was not enough
+            if self.cfg.idle_secs > 0 {
+                eprintln!("[vision] encoder stopped after {} s without a picture", self.cfg.idle_secs);
+            }
+        }
     }
 
     fn spawn(&self) -> Result<Proc, String> {
@@ -170,6 +213,7 @@ impl VisionEncoder {
         let img = self.dir.join(format!("{key:016x}.img"));
         let sve = self.dir.join(format!("{key:016x}.sve"));
         std::fs::write(&img, data).map_err(|e| format!("image temp file: {e}"))?;
+        *self.last_use.lock().unwrap() = std::time::Instant::now();
         let mut guard = self.proc.lock().unwrap();
         if guard.is_none() {
             *guard = Some(self.spawn()?);
@@ -207,6 +251,7 @@ impl VisionEncoder {
         if n == 0 {
             return Err("the image gave no tokens".into());
         }
+        *self.last_use.lock().unwrap() = std::time::Instant::now();
         drop(guard);
         let mut c = self.cache.lock().unwrap();
         c.0.insert(key, (sve.clone(), n));
@@ -267,8 +312,26 @@ pub fn encoder_from_config(cfg: &crate::config::ServerConfig) -> Option<std::syn
     let v = cfg.vision.clone()?;
     match VisionEncoder::new(v) {
         Ok(e) => {
-            eprintln!("[vision] images on (encoder starts with the first picture)");
-            Some(std::sync::Arc::new(e))
+            eprintln!(
+                "[vision] images on (encoder starts with the first picture{})",
+                if e.cfg.idle_secs > 0 {
+                    format!(", stops after {} s without one", e.cfg.idle_secs)
+                } else {
+                    ", stops after each request's pictures".to_string()
+                }
+            );
+            let arc = std::sync::Arc::new(e);
+            {
+                let w = std::sync::Arc::downgrade(&arc);
+                let _ = std::thread::Builder::new().name("vision-idle".into()).spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    match w.upgrade() {
+                        Some(e) => e.reap_idle(),
+                        None => break,
+                    }
+                });
+            }
+            Some(arc)
         }
         Err(e) => {
             eprintln!("[vision] no encoder ({e}): text only");
