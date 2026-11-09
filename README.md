@@ -6,6 +6,80 @@ Talus runs large open-weight language models on one AMD Strix Halo machine (Ryze
 gfx1151) with 128 GB of unified memory. It is a Rust host over a library of HIP kernels tuned for that GPU, and it
 serves each model through an OpenAI-compatible HTTP API.
 
+## About this fork
+
+This is a fork of Talus v0.1.6 (branch `glm-vision`) that adds three things for GLM-5.3-Flash. It is not part of
+upstream Talus: please report problems with these additions here, not upstream. Without the new settings it behaves
+like upstream, and greedy text output is identical to v0.1.6.
+
+- **Pictures.** With a `vision` block in the run config, the server accepts base64 pictures: OpenAI `image_url` (data
+  URLs), Responses `input_image` and Anthropic `image` parts. Other models stay text only.
+- **Conversation parking.** Agents often send a side request (a title, a review, a picture description) between turns
+  of the main conversation. The engine has one prompt cache, so the next main turn used to read its whole prompt again.
+  With `GLM_PARK_DIR` set, the engine saves the conversation's cached state to disk before a side request overwrites
+  it, and reads it back when the conversation continues.
+- **128K context with pictures** on a 128 GB machine. The picture encoder quits as soon as it is done, so its memory
+  goes back to the engine.
+
+Build it as described under [Build](#build), from the `glm-vision` branch.
+
+### Pictures
+
+1. Build Project Maya's `maya-vision` encoder and download GLM's projector and vocabulary files (about 1.14 GB), as
+   in Maya's [CPU image encoder on Linux](https://github.com/mw00/project-maya/blob/main/docs/AMD_MAYA.md#cpu-image-encoder-on-linux).
+   Strata's `strata-vision` speaks the same protocol and works too.
+2. Add a `vision` block to the GLM-5.3-Flash run config:
+
+```json
+"vision": {
+  "exe": "/path/to/maya/build-vision-cpu/bin/maya-vision",
+  "mmproj": "/path/to/mmproj-GLM-5.3-Flash-F16.gguf",
+  "model": "/path/to/GLM-5.3-Flash-vocab.gguf",
+  "gpu": false,
+  "threads": 16,
+  "max_tokens": 2048,
+  "idle_secs": 0
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `exe`, `mmproj`, `model` | Required: the encoder, the projector GGUF and a GGUF with the model's vocabulary. |
+| `gpu` | `false` (default) runs the encoder on the CPU. |
+| `threads` | The encoder's CPU threads. |
+| `max_tokens` | The most image tokens per picture; larger pictures are scaled down. One token covers 28×28 pixels, so 2048 is about 1.6 megapixels. A 3840×2160 picture takes about 8K tokens, 137 s and 3.75 GB uncapped, or 1,980 tokens, 12.8 s and 2.0 GB at 2048. |
+| `idle_secs` | The encoder (1.6-2 GB) quits after this many seconds without a picture (default 60) and starts again in about 1 s. `0` quits as soon as a request's pictures are encoded, before the engine reads the request; use it at 128K context. |
+
+The encoder starts with the first picture. Pictures that can't be read, http(s) URLs and bad base64 get HTTP 400; no
+picture is ever silently dropped. `/v1/models` lists image input. The prompt cache keys each picture by a hash of its
+content, so a cached prefix only matches when the pictures are the same.
+
+### Conversation parking
+
+Set these in the run config's `env`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GLM_PARK_DIR` | unset (off) | Directory for parked conversations. Leftover `park-*.bin` files from an earlier run are removed at start. |
+| `GLM_PARK_MAX` | 2 | Conversations kept parked; the least recently used goes first. |
+| `GLM_PARK_MIN` | 4096 | Shorter conversations are not parked, because they are cheap to read again. |
+
+The parked state is exactly what the in-memory cache would have resumed from, so the continued turn is the same as
+if there had been no side request. Greedy output was identical in our test. On a Strix Halo laptop (128 GB, 50 W),
+an 87.5K-token conversation parked as a 1.26 GB file in 1.75 s and came back in 0.34 s. A 128K-token conversation
+takes about 1.8 GB. Reading 126K tokens again from scratch took 367 s.
+
+### 128K context
+
+Pass `--ctx 131072` instead of the 64K in the shipped GLM config. On the same laptop, with a desktop session running
+and `idle_secs: 0`, at least 7.4 GB stayed free during agent sessions up to the full window, with
+`TALUS_MEM_FLOOR_GIB=6` (Talus's default floor is 8 GiB). Three facts planted at 10, 50 and 90 % of a
+102.7K-token prompt were all recalled. A cold read ran at 377 tokens/s, and decode at 27-34 tokens/s, slower deeper
+into the context.
+
+Agent clients should be told the context size rather than detect it, set a little below the server's. We use 125K
+for 131,072. The client then compacts its conversation before the window is full, instead of overflowing it.
+
 ## How fast is it?
 
 The current release is **v0.1.6**: faster prompt processing and code editing on Qwen3.8-Flash-Next, follow-up turns on
@@ -264,7 +338,8 @@ and chat UIs connect to it directly.
 - **Text only:** the models are served as text models. A request with an image, audio or file content part
   (`image_url`, `input_image`, `image`, `input_audio`, `file`, ...) gets HTTP 400 with the error code
   `unsupported_content` (on `/v1/messages`, an Anthropic `invalid_request_error`), instead of an answer that ignores
-  the attachment.
+  the attachment. (This fork: GLM-5.3-Flash takes pictures when its run config has a `vision` block; see
+  [About this fork](#about-this-fork).)
 
 `talus-server` starts the engine (`talus-cli`) as a subprocess and talks to it over stdin/stdout; see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#serving).
@@ -312,3 +387,8 @@ kernel library, the server and much of the host's design come from Strata. Kerne
 [ggml and llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT). The full list, with licenses, is in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Thanks to the model authors (Qwen, Z.ai, Xiaomi MiMo, poolside),
 to Unsloth for the GGUF quants, and to z-lab for the DFlash drafters.
+
+This fork's picture support is based on kva19's Flash-Next vision glue
+([nsbradley88/talus-public PR #7](https://github.com/nsbradley88/talus-public/pull/7), MIT), with the fixes from the
+maintainer's review of it. The picture encoder is [Project Maya](https://github.com/mw00/project-maya)'s `maya-vision`
+(MIT), built on llama.cpp's `mtmd`.
